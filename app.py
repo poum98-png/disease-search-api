@@ -144,7 +144,7 @@ def search():
     if not q:
         return jsonify({"error": "q is required"}), 400
 
-    # 1) 비증상 질문 차단 (가격/예약/보험/위치 등)
+    # 1) 비증상 질문 차단
     if looks_non_symptom(q):
         return jsonify({
             "query": q,
@@ -153,7 +153,7 @@ def search():
             "results": []
         }), 200
 
-    # 2) 너무 짧거나 애매한 질문은 추가 정보 요청(재질문)
+    # 2) 너무 포괄/짧은 증상은 재질문 유도
     if looks_too_vague(q):
         return jsonify({
             "query": q,
@@ -162,48 +162,77 @@ def search():
             "results": []
         }), 200
 
-    # k 파싱 (UI에서 많이 요청할 수 있게 상한 50으로)
-    k = request.args.get("k", str(DEFAULT_TOPK))
+    # UI에 보여줄 최대 질환 수 (기본 12, UI에서 6개 먼저 보여주고 더보기)
+    show_k = request.args.get("k", str(DEFAULT_TOPK))
     try:
-        k = int(k)
+        show_k = int(show_k)
     except:
-        k = DEFAULT_TOPK
-    k = max(1, min(50, k))
+        show_k = DEFAULT_TOPK
+    show_k = max(1, min(50, show_k))
+
+    # 내부적으로는 phrase(행)를 많이 가져와야 그룹핑이 잘 됨
+    # 523행이면 200~300이면 충분
+    fetch_k = int(request.args.get("fetch_k", "250"))
+    fetch_k = max(50, min(300, fetch_k))
 
     qvec = embed_text(q)
     qvec_literal = vec_to_pgvector_literal(qvec)
 
+    # phrase(행) 단위 매칭 결과 많이 받아오기
     resp = sb.rpc("match_diseases", {
         "query_embedding": qvec_literal,
-        "match_count": k
+        "match_count": fetch_k
     }).execute()
 
-    results = resp.data or []
-    if not results:
-        return jsonify({"query": q, "topk": k, "blocked": False, "results": []})
+    rows = resp.data or []
+    if not rows:
+        return jsonify({
+            "query": q,
+            "blocked": False,
+            "results": []
+        })
 
-    # 1등 기준 상대 컷: 1등보다 너무 멀면 제거
-    top_score = results[0].get("score", 0.0)
+    # 질환 단위로 그룹핑: id에서 # 앞부분만 base_id로 사용
+    grouped = {}
+    for r in rows:
+        rid = r.get("id", "")
+        base_id = rid.split("#", 1)[0]  # disease-xxx#001 -> disease-xxx
+        score = float(r.get("score", 0.0) or 0.0)
 
-    # 예: 1등 - 0.08보다 낮으면 제거 (조정 가능)
-    WINDOW = 0.08
+        cur = grouped.get(base_id)
+        if (cur is None) or (score > cur["score"]):
+            grouped[base_id] = {
+                "id": base_id,
+                "title": r.get("title", ""),
+                "url": r.get("url", ""),
+                "score": score
+            }
 
-    filtered = [r for r in results if r.get("score", 0.0) >= (top_score - WINDOW)]
+    diseases = list(grouped.values())
+    diseases.sort(key=lambda x: x["score"], reverse=True)
 
-    # 그래도 너무 많으면 최대 12개까지만 반환 (원하면 6/10/15로 조정)
-    MAX_RETURN = 12
-    filtered = filtered[:MAX_RETURN]
+    # 상대 컷(절대 threshold 대신): 1등과 너무 차이나는 후보 제거
+    top_score = diseases[0]["score"]
+    WINDOW = float(os.getenv("RELATIVE_WINDOW", "0.08"))  # 필요하면 Render 환경변수로 조정
+    diseases = [d for d in diseases if d["score"] >= (top_score - WINDOW)]
 
+    # 최종 출력 개수 제한 (UI가 더보기를 처리하더라도 서버에서 상한을 둠)
+    MAX_RETURN = int(os.getenv("MAX_RETURN", "20"))
+    diseases = diseases[:min(MAX_RETURN, len(diseases))]
+
+    # UI는 점수 안 보여주지만, 서버/디버깅용으로 score는 유지해도 됨
+    # (원하면 아래에서 score를 제거해도 됩니다)
     return jsonify({
         "query": q,
-        "topk": k,
         "blocked": False,
-        "results": filtered
+        "results": diseases[:show_k]  # show_k까지만 우선 반환
     })
+
 
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=True)
+
 
 
 
