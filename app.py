@@ -1,7 +1,11 @@
 import os
+import json
+
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
+
+import requests
 
 from openai import OpenAI
 from supabase import create_client
@@ -228,10 +232,71 @@ def search():
         "results": diseases[:show_k]  # show_k까지만 우선 반환
     })
 
+@app.post("/classify")
+def classify():
+    data = request.get_json(silent=True) or {}
+    text = (data.get("text") or "").strip()
 
+    if not text:
+        return jsonify({"error": "text is required"}), 400
+
+    # LLM에게 줄 프롬프트
+    system_prompt = """
+너는 치과 증상 문장을 분류하는 정보추출기다.
+아래 5개 카테고리만 JSON으로 출력해라.
+
+- location
+- pain_pattern
+- trigger
+- associated_signs
+- negation
+
+규칙:
+- 문장에 있는 정보만 사용
+- 각 값은 문자열 배열
+- 없으면 []
+- JSON 외 다른 텍스트 금지
+"""
+
+    try:
+        response = oa.chat.completions.create(
+            model="gpt-4.1-mini",  # 원하면 환경변수로 빼도 됨
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": text}
+            ],
+            temperature=0
+        )
+
+        content = response.choices[0].message.content.strip()
+
+        # 혹시 ```json``` 감싸져 나오면 제거
+        if content.startswith("```"):
+            content = content.strip("`")
+            content = content.replace("json", "", 1).strip()
+
+        result = json.loads(content)
+
+        # 안전 보정
+        for k in ["location", "pain_pattern", "trigger", "associated_signs", "negation"]:
+            if k not in result or not isinstance(result[k], list):
+                result[k] = []
+
+        return jsonify({
+            "ok": True,
+            "input": text,
+            "result": result
+        })
+
+    except Exception as e:
+        return jsonify({
+            "ok": False,
+            "error": str(e)
+        }), 500
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=True)
+
 
 
 
