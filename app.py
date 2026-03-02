@@ -179,14 +179,31 @@ def search():
     }).execute()
 
     results = resp.data or []
+    if not results:
+        return jsonify({"query": q, "topk": k, "blocked": False, "results": []})
+
+    # 1등 기준 상대 컷: 1등보다 너무 멀면 제거
+    top_score = results[0].get("score", 0.0)
+
+    # 예: 1등 - 0.08보다 낮으면 제거 (조정 가능)
+    WINDOW = 0.08
+
+    filtered = [r for r in results if r.get("score", 0.0) >= (top_score - WINDOW)]
+
+    # 그래도 너무 많으면 최대 12개까지만 반환 (원하면 6/10/15로 조정)
+    MAX_RETURN = 12
+    filtered = filtered[:MAX_RETURN]
+
     return jsonify({
         "query": q,
         "topk": k,
         "blocked": False,
-        "results": results
+        "results": filtered
     })
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=True)
+
 
 
