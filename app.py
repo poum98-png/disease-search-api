@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 
 from openai import OpenAI
 from supabase import create_client
+from collections import defaultdict
 
 load_dotenv()
 
@@ -35,6 +36,38 @@ def embed_text(text: str) -> list[float]:
         return []
     res = oa.embeddings.create(model=EMBED_MODEL, input=text)
     return res.data[0].embedding
+
+def build_query_text_from_units(units: list[dict], key: str) -> str:
+    """
+    units 배열에서 특정 카테고리(key)의 값들을 모아 임베딩용 텍스트를 만든다.
+    - 중복 제거
+    - 너무 길면 일부만 사용
+    """
+    vals = []
+    seen = set()
+
+    for u in units or []:
+        items = u.get(key, [])
+        if not isinstance(items, list):
+            continue
+        for it in items:
+            s = str(it).strip()
+            if not s:
+                continue
+            if s in seen:
+                continue
+            seen.add(s)
+            vals.append(s)
+
+    # 너무 길면 앞부분만 사용(임베딩 안정/비용 절감)
+    MAX_ITEMS = int(os.getenv("SMART_MAX_ITEMS_PER_CAT", "20"))
+    vals = vals[:MAX_ITEMS]
+
+    if not vals:
+        return ""
+
+    # 포맷 고정(가벼운 정리): "key: a, b, c"
+    return f"{key}: " + ", ".join(vals)
 
 def vec_to_pgvector_literal(vec: list[float]) -> str:
     # pgvector는 "[0.1,0.2,...]" 형태 문자열 캐스팅이 가장 안전합니다.
@@ -270,8 +303,191 @@ def classify():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
+@app.post("/smart-search")
+def smart_search():
+    """
+    입력 텍스트 → /classify(의미 단위 분리+분류) → 4개 카테고리 임베딩 →
+    match_disease_vectors RPC를 카테고리별로 호출 → 질환별 점수 합산 → TopK 반환
+    """
+    data = request.get_json(silent=True) or {}
+    q = (data.get("text") or "").strip()
+    if not q:
+        return jsonify({"error": "text is required"}), 400
+
+    # (선택) 기존 차단/재질문 로직도 그대로 재사용 가능
+    if looks_non_symptom(q):
+        return jsonify({
+            "query": q,
+            "blocked": True,
+            "message": "증상(불편감) 기반 질문에 대해서만 안내가 가능합니다. 예) 치아가 시려요, 잇몸이 붓고 피나요, 씹을 때 아파요",
+            "results": []
+        }), 200
+
+    if looks_too_vague(q):
+        return jsonify({
+            "query": q,
+            "blocked": True,
+            "message": "어느 부위가 언제부터, 어떤 상황에서 더 불편한가요? (예: 오른쪽 아래 잇몸이 3일 전부터 붓고 씹을 때 아파요 / 찬물 마시면 특정 치아가 찌릿해요)",
+            "results": []
+        }), 200
+
+    # TopK
+    topk = int(data.get("k") or DEFAULT_TOPK)
+    topk = max(1, min(50, topk))
+
+    # 카테고리별로 가져올 벡터 수
+    fetch_k = int(data.get("fetch_k") or os.getenv("SMART_FETCH_K", "30"))
+    fetch_k = max(10, min(100, fetch_k))
+
+    # 카테고리 가중치(후보 제시형 추천값)
+    W_LOCATION = float(os.getenv("W_LOCATION", "1.0"))
+    W_PAIN     = float(os.getenv("W_PAIN", "0.9"))
+    W_TRIGGER  = float(os.getenv("W_TRIGGER", "0.8"))
+    W_ASSOC    = float(os.getenv("W_ASSOC", "0.6"))
+
+    # 1) LLM 분류 호출: 내부 함수처럼 /classify 로직을 재사용하기 위해
+    #    현재 app.py에 /classify가 있으니, HTTP로 다시 부르지 말고 "직접 호출"이 가장 깔끔하지만
+    #    구조를 크게 바꾸지 않으려면 여기서는 oa.chat을 한 번 더 호출하지 않고,
+    #    /classify가 이미 구현되어 있다는 전제에서 "같은 프롬프트"를 함수화해서 재사용하는 게 이상적입니다.
+    #
+    # 지금은 간단하게: classify()가 반환하는 형식과 동일하게,
+    # 프론트에서 먼저 /classify 호출 후 units를 넘겨도 됩니다.
+    #
+    # → 여기서는 data에 units가 있으면 그걸 사용하고,
+    #   없으면 /classify에 해당하는 LLM 호출을 한 번 수행하도록 합니다.
+
+    units = data.get("units")
+    if not isinstance(units, list):
+        # units가 없으면, 기존 /classify와 동일 프롬프트로 1회 호출해서 units 생성
+        # (당신 app.py의 /classify와 동일한 system_prompt를 그대로 쓰는 게 베스트)
+        # 여기서는 /classify에서 쓰는 system_prompt를 CLASSIFY_SYSTEM_PROMPT 환경변수로 빼는 방식을 추천하지만,
+        # 빠르게 동작하게 하려고 간단히 호출합니다.
+
+        classify_system_prompt = os.getenv("CLASSIFY_SYSTEM_PROMPT", "").strip()
+        if not classify_system_prompt:
+            return jsonify({
+                "error": "units가 없고, CLASSIFY_SYSTEM_PROMPT 환경변수도 비어있습니다. 먼저 /classify 결과 units를 보내거나 CLASSIFY_SYSTEM_PROMPT를 설정하세요."
+            }), 400
+
+        try:
+            resp = oa.chat.completions.create(
+                model=os.getenv("CLASSIFY_MODEL", "gpt-4.1-mini"),
+                messages=[
+                    {"role": "system", "content": classify_system_prompt},
+                    {"role": "user", "content": q}
+                ],
+                temperature=0
+            )
+            content = resp.choices[0].message.content.strip()
+            if content.startswith("```"):
+                content = content.strip("`")
+                content = content.replace("json", "", 1).strip()
+            obj = json.loads(content)
+            units = obj.get("units", [])
+            if not isinstance(units, list):
+                units = []
+        except Exception as e:
+            return jsonify({"error": f"classify failed: {str(e)}"}), 500
+
+    # 2) 4개 카테고리별 임베딩 텍스트 생성
+    q_loc   = build_query_text_from_units(units, "location")
+    q_pain  = build_query_text_from_units(units, "pain_pattern")
+    q_trig  = build_query_text_from_units(units, "trigger")
+    q_assoc = build_query_text_from_units(units, "associated_signs")
+
+    # 전부 비면 검색 불가
+    if not any([q_loc, q_pain, q_trig, q_assoc]):
+        return jsonify({
+            "query": q,
+            "blocked": True,
+            "message": "증상 정보를 더 알려주세요. (예: 어디가 아픈지 / 어떤 느낌인지 / 언제 더 심한지)",
+            "results": [],
+            "units": units
+        }), 200
+
+    # 3) 카테고리별 임베딩 생성
+    vec_loc   = embed_text(q_loc)   if q_loc else None
+    vec_pain  = embed_text(q_pain)  if q_pain else None
+    vec_trig  = embed_text(q_trig)  if q_trig else None
+    vec_assoc = embed_text(q_assoc) if q_assoc else None
+
+    # 4) RPC 호출 helper
+    def rpc_match(vec, vtype: str):
+        if not vec:
+            return []
+        vec_literal = vec_to_pgvector_literal(vec)
+        resp = sb.rpc("match_disease_vectors", {
+            "query_embedding": vec_literal,
+            "match_count": fetch_k,
+            "filter_vector_type": vtype
+        }).execute()
+        return resp.data or []
+
+    rows_loc   = rpc_match(vec_loc, "location")
+    rows_pain  = rpc_match(vec_pain, "pain_pattern")
+    rows_trig  = rpc_match(vec_trig, "trigger")
+    rows_assoc = rpc_match(vec_assoc, "associated_signs")
+
+    # 5) 질환별 점수 합산
+    scores = defaultdict(float)
+    meta = {}  # disease_id -> {title,url}
+
+    def add_rows(rows, weight: float):
+        for r in rows:
+            did = r.get("disease_id")
+            if not did:
+                continue
+            score = float(r.get("score", 0.0) or 0.0)
+            scores[did] += score * weight
+            if did not in meta:
+                meta[did] = {
+                    "disease_id": did,
+                    "title": r.get("title", ""),
+                    "url": r.get("url", "")
+                }
+
+    add_rows(rows_loc,   W_LOCATION)
+    add_rows(rows_pain,  W_PAIN)
+    add_rows(rows_trig,  W_TRIGGER)
+    add_rows(rows_assoc, W_ASSOC)
+
+    # 6) 정렬 + TopK
+    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    ranked = ranked[:topk]
+
+    results = []
+    for did, sc in ranked:
+        m = meta.get(did, {"disease_id": did, "title": "", "url": ""})
+        results.append({
+            "id": did,
+            "title": m["title"],
+            "url": m["url"],
+            "score": round(sc, 6)  # 디버깅용 (원하면 제거)
+        })
+
+    return jsonify({
+        "query": q,
+        "blocked": False,
+        "results": results,
+        "units": units,
+        "debug": {
+            "q_location": q_loc,
+            "q_pain_pattern": q_pain,
+            "q_trigger": q_trig,
+            "q_associated_signs": q_assoc,
+            "weights": {
+                "location": W_LOCATION,
+                "pain_pattern": W_PAIN,
+                "trigger": W_TRIGGER,
+                "associated_signs": W_ASSOC
+            },
+            "fetch_k": fetch_k
+        }
+    })
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=True)
+
 
 
 
