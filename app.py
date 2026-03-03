@@ -173,6 +173,81 @@ def admin_embed_all():
         "failed": failed
     })
 
+@app.post("/admin/embed-vectors")
+def admin_embed_vectors():
+    """
+    disease_vectors 테이블에서 embedding이 NULL인 행들을 임베딩으로 채웁니다.
+    - ADMIN_TOKEN으로 보호
+    - vector_type + content_text 를 임베딩 입력으로 사용
+    """
+    token = request.args.get("token", "")
+    if not ADMIN_TOKEN or token != ADMIN_TOKEN:
+        return jsonify({"error": "unauthorized"}), 401
+
+    # 한 번에 처리할 최대 개수(기본 500)
+    limit = request.args.get("limit", "500")
+    try:
+        limit = int(limit)
+    except:
+        limit = 500
+    limit = max(1, min(2000, limit))
+
+    # embedding NULL인 행만 가져오기
+    resp = (
+        sb.table("disease_vectors")
+        .select("id, vector_type, content_text")
+        .is_("embedding", "null")
+        .limit(limit)
+        .execute()
+    )
+
+    rows = resp.data or []
+    if not rows:
+        return jsonify({"ok": True, "message": "No NULL embeddings found", "updated": 0, "failed": []})
+
+    updated = 0
+    failed = []
+
+    for r in rows:
+        row_id = r.get("id")
+        vtype = (r.get("vector_type") or "").strip()
+        content_text = (r.get("content_text") or "").strip()
+
+        if not row_id:
+            failed.append({"id": None, "reason": "missing id"})
+            continue
+        if not content_text:
+            failed.append({"id": row_id, "reason": "empty content_text"})
+            continue
+
+        # 임베딩 입력 텍스트(포맷 고정)
+        # 예: "location: 치아, 어금니, ..."
+        embed_input = f"{vtype}: {content_text}" if vtype else content_text
+
+        try:
+            vec = embed_text(embed_input)
+            if not vec:
+                failed.append({"id": row_id, "reason": "empty embedding"})
+                continue
+
+            vec_literal = vec_to_pgvector_literal(vec)
+
+            sb.table("disease_vectors").update({
+                "embedding": vec_literal
+            }).eq("id", row_id).execute()
+
+            updated += 1
+
+        except Exception as e:
+            failed.append({"id": row_id, "reason": str(e)})
+
+    return jsonify({
+        "ok": True,
+        "total_candidates": len(rows),
+        "updated": updated,
+        "failed": failed
+    })
+
 @app.post("/classify")
 def classify():
     data = request.get_json(silent=True) or {}
@@ -487,6 +562,7 @@ def smart_search():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=True)
+
 
 
 
