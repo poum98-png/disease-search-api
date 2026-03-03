@@ -148,9 +148,24 @@ def classify():
     if not text:
         return jsonify({"error": "text is required"}), 400
 
+    # 너무 긴 입력은 비용/품질 위해 컷(원하면 길이 조정 가능)
+    MAX_CHARS = int(os.getenv("CLASSIFY_MAX_CHARS", "800"))
+    if len(text) > MAX_CHARS:
+        text = text[:MAX_CHARS]
+
     system_prompt = """
 너는 치과 증상 문장을 구조화하는 정보추출기다.
-사용자 문장에서 아래 9개 카테고리만 추출해 "반드시 JSON만" 출력하라.
+입력은 사용자가 자유롭게 쓴 한국어 텍스트이며, 마침표/줄바꿈이 없을 수 있다.
+
+너의 작업은 2단계다:
+
+1) 입력을 "의미 단위"로 1~8개로 분리한다.
+   - 의미 단위는 증상/위치/자극요인/시간경과/부정/배경 등이 바뀌는 지점이다.
+   - 마침표나 줄바꿈이 없어도 적절히 분리하라.
+   - 지나치게 잘게 쪼개지 말고, 각 단위가 의미를 가지게 하라.
+   - 분리한 각 단위의 원문을 text 필드에 그대로 넣어라.
+
+2) 각 의미 단위마다 아래 9개 카테고리만 추출해, "반드시 JSON만" 출력하라.
 
 카테고리(반드시 이 키만 사용):
 - location: 해부학적 위치/부위(치아, 어금니, 앞니, 치아 사이, 잇몸, 턱관절 등)
@@ -164,9 +179,28 @@ def classify():
 - context: 배경/원인 단서(최근 치료/시술, 임플란트/교정, 외상(딱딱한 거 씹다), 이갈이, 스케일링 후 등)
 
 규칙:
-1) 추측하지 말고, 문장에 명시된 정보만 추출하라.
-2) 각 값은 문자열 배열(list of strings)로 반환하라. 없으면 [].
-3) JSON 외의 어떤 텍스트도 출력하지 말라.
+- 추측하지 말고, 입력에 명시된 정보만 추출하라.
+- 각 카테고리는 문자열 배열(list of strings)로 반환하라. 없으면 [].
+- JSON 외의 어떤 텍스트도 출력하지 말라.
+- 반드시 아래 출력 형식만 사용하라.
+
+출력 형식(반드시 준수):
+{
+  "units": [
+    {
+      "text": "...",
+      "location": [],
+      "laterality": [],
+      "pain_pattern": [],
+      "trigger": [],
+      "associated_signs": [],
+      "time_course": [],
+      "severity_urgency": [],
+      "negation": [],
+      "context": []
+    }
+  ]
+}
 """
 
     try:
@@ -186,25 +220,47 @@ def classify():
             content = content.strip("`")
             content = content.replace("json", "", 1).strip()
 
-        result = json.loads(content)
+        obj = json.loads(content)
 
-        # 안전 보정(키 누락/형식 오류 방어)
+        # 안전 보정
+        units = obj.get("units", [])
+        if not isinstance(units, list):
+            units = []
+
+        # 최대 8개로 제한
+        MAX_UNITS = int(os.getenv("CLASSIFY_MAX_UNITS", "8"))
+        units = units[:MAX_UNITS]
+
         keys = [
             "location", "laterality", "pain_pattern", "trigger",
             "associated_signs", "time_course", "severity_urgency",
             "negation", "context"
         ]
-        for k in keys:
-            if k not in result or not isinstance(result[k], list):
-                result[k] = []
 
-        return jsonify({"ok": True, "input": text, "result": result})
+        normalized_units = []
+        for u in units:
+            if not isinstance(u, dict):
+                continue
+            nu = {"text": str(u.get("text", "")).strip()}
+            for k in keys:
+                v = u.get(k, [])
+                nu[k] = v if isinstance(v, list) else []
+            # text가 비어있으면 제외
+            if nu["text"]:
+                normalized_units.append(nu)
+
+        return jsonify({
+            "ok": True,
+            "input": text,
+            "units": normalized_units
+        })
 
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=True)
+
 
 
 
