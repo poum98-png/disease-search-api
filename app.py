@@ -503,17 +503,27 @@ def smart_search():
     rows_trig  = rpc_match(vec_trig, "trigger")
     rows_assoc = rpc_match(vec_assoc, "associated_signs")
 
-    # 5) 질환별 점수 합산
-    scores = defaultdict(float)
+    # 5) 질환별 점수 합산 + 카테고리별 breakdown
+    total_scores = defaultdict(float)
+    breakdown = defaultdict(lambda: {
+        "location": 0.0,
+        "pain_pattern": 0.0,
+        "trigger": 0.0,
+        "associated_signs": 0.0
+    })
     meta = {}  # disease_id -> {title,url}
 
-    def add_rows(rows, weight: float):
+    def add_rows(rows, vtype: str, weight: float):
         for r in rows:
             did = r.get("disease_id")
             if not did:
                 continue
-            score = float(r.get("score", 0.0) or 0.0)
-            scores[did] += score * weight
+            raw = float(r.get("score", 0.0) or 0.0)  # RPC가 준 similarity
+            contrib = raw * weight                   # 가중치 반영 점수
+
+            total_scores[did] += contrib
+            breakdown[did][vtype] += contrib
+
             if did not in meta:
                 meta[did] = {
                     "disease_id": did,
@@ -521,23 +531,29 @@ def smart_search():
                     "url": r.get("url", "")
                 }
 
-    add_rows(rows_loc,   W_LOCATION)
-    add_rows(rows_pain,  W_PAIN)
-    add_rows(rows_trig,  W_TRIGGER)
-    add_rows(rows_assoc, W_ASSOC)
+    add_rows(rows_loc,   "location",         W_LOCATION)
+    add_rows(rows_pain,  "pain_pattern",     W_PAIN)
+    add_rows(rows_trig,  "trigger",          W_TRIGGER)
+    add_rows(rows_assoc, "associated_signs", W_ASSOC)
 
     # 6) 정렬 + TopK
-    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-    ranked = ranked[:topk]
+    ranked = sorted(total_scores.items(), key=lambda x: x[1], reverse=True)[:topk]
 
     results = []
-    for did, sc in ranked:
+    for did, total in ranked:
         m = meta.get(did, {"disease_id": did, "title": "", "url": ""})
+        bd = breakdown[did]
         results.append({
             "id": did,
             "title": m["title"],
             "url": m["url"],
-            "score": round(sc, 6)  # 디버깅용 (원하면 제거)
+            "score_total": round(total, 6),
+            "score_breakdown": {
+                "location": round(bd["location"], 6),
+                "pain_pattern": round(bd["pain_pattern"], 6),
+                "trigger": round(bd["trigger"], 6),
+                "associated_signs": round(bd["associated_signs"], 6),
+            }
         })
 
     return jsonify({
@@ -562,6 +578,7 @@ def smart_search():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=True)
+
 
 
 
