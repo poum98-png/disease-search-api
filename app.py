@@ -2,11 +2,13 @@ import os
 import json
 from collections import defaultdict
 
+from dotenv import load_dotenv
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from openai import OpenAI
 from supabase import create_client, Client
 
+load_dotenv()
 
 # =========================
 # App / Env
@@ -524,3 +526,4 @@ if __name__ == "__main__":
         port=int(os.getenv("PORT", "5000")),
         debug=True
     )
+
