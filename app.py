@@ -1,6 +1,6 @@
 import os
 import json
-from collections import defaultdict
+from typing import Any
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -10,16 +10,14 @@ from supabase import create_client
 
 load_dotenv()
 
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()
 
-EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
+# 모델 설정
 CLASSIFY_MODEL = os.getenv("CLASSIFY_MODEL", "gpt-4.1-mini")
 DEFAULT_TOPK = int(os.getenv("DEFAULT_TOPK", "5"))
-DEFAULT_FETCH_K = int(os.getenv("FETCH_K", "30"))
-CLASSIFY_MAX_UNITS = int(os.getenv("CLASSIFY_MAX_UNITS", "8"))
 
 if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
     raise RuntimeError("SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY 환경변수를 설정하세요.")
@@ -34,21 +32,9 @@ oa = OpenAI(api_key=OPENAI_API_KEY)
 
 
 # =========================
-# 기본 유틸
+# 유틸
 # =========================
-def embed_text(text: str) -> list[float]:
-    text = (text or "").strip()
-    if not text:
-        return []
-    res = oa.embeddings.create(model=EMBED_MODEL, input=text)
-    return res.data[0].embedding
-
-
-def vec_to_pgvector_literal(vec: list[float]) -> str:
-    return "[" + ",".join(f"{x:.8f}" for x in vec) + "]"
-
-
-def safe_json_loads(content: str):
+def safe_json_loads(content: str) -> Any:
     content = (content or "").strip()
     if content.startswith("```"):
         content = content.strip("`")
@@ -57,57 +43,58 @@ def safe_json_loads(content: str):
     return json.loads(content)
 
 
+def normalize_relevance(v: str) -> str:
+    v = (v or "").strip().lower()
+    if v in ["high", "medium", "low"]:
+        return v
+    return "medium"
+
+
 # =========================
 # 질문 차단 로직
-# - "증상 검색이 아닌 질문"만 차단
-# - "모호한 입력"은 통과
+# - 증상 검색이 아닌 질문만 차단
+# - 모호한 증상 입력은 통과
 # =========================
-NON_SYMPTOM_QUESTION_KEYWORDS = [
+NON_SYMPTOM_KEYWORDS = [
     "가격", "비용", "얼마", "원", "만원", "견적",
     "보험", "실비", "청구", "적용", "서류",
-    "예약", "진료시간", "시간", "영업", "휴무",
+    "예약", "진료시간", "영업", "휴무",
     "위치", "주소", "주차", "길찾기",
     "이벤트", "할인", "쿠폰",
     "후기", "리뷰",
     "원장", "의사", "스태프",
-    "상담", "문의",
-    "치료비", "치료가격"
+    "상담", "문의", "전화", "연락",
+    "치료비", "수술비"
 ]
 
 QUESTION_ENDINGS = [
     "뭐예요", "뭔가요", "무엇인가요", "왜 그런가요", "왜 이래요",
     "어떻게 하나요", "어떻게 해요", "되나요", "가능한가요",
-    "괜찮나요", "인가요", "나요"
+    "인가요", "나요", "일까요", "알 수 있나요"
 ]
 
 
 def looks_non_symptom_question(q: str) -> bool:
-    """
-    증상 검색이 아닌 '질문성 문의'만 차단.
-    모호한 증상 입력(예: 아파요, 시려요)은 차단하지 않음.
-    """
     q = (q or "").strip()
     if not q:
         return False
 
-    if "?" in q and any(k in q for k in NON_SYMPTOM_QUESTION_KEYWORDS):
+    if "?" in q and any(k in q for k in NON_SYMPTOM_KEYWORDS):
         return True
 
-    if any(k in q for k in NON_SYMPTOM_QUESTION_KEYWORDS):
-        if any(e in q for e in QUESTION_ENDINGS):
-            return True
+    if any(k in q for k in NON_SYMPTOM_KEYWORDS) and any(e in q for e in QUESTION_ENDINGS):
+        return True
 
-    # 증상 단서 없이, 문의성 키워드만 있는 짧은 질문
-    if len(q) <= 20 and any(k in q for k in NON_SYMPTOM_QUESTION_KEYWORDS):
+    if len(q) <= 20 and any(k in q for k in NON_SYMPTOM_KEYWORDS):
         return True
 
     return False
 
 
 # =========================
-# 의미 단위 분리
-# - 원문 그대로
-# - 모호한 입력도 통과
+# 의미 단위 분리 (선택)
+# - 원문 그대로 유지
+# - 질환 추론용 보조 정보
 # =========================
 CLASSIFY_SYSTEM_PROMPT = """
 너는 치과 증상 검색용 문장 분리기다.
@@ -118,8 +105,7 @@ CLASSIFY_SYSTEM_PROMPT = """
 - 축약, 요약, 교정, 재작성, 번역을 하지 않는다.
 - 입력에 없는 말을 보충하지 않는다.
 - 너무 잘게 쪼개지지 말고, 각 단위가 의미를 가지게 한다.
-- 모호한 입력이라도 가능한 범위에서 units를 만든다.
-- 다만 증상 검색이 아닌 일반 문의/가격/예약/위치/보험 질문이면 is_symptom_search=false 로 판단한다.
+- 증상 검색이 아닌 일반 문의/가격/예약/위치/보험 질문이면 is_symptom_search=false 로 판단한다.
 
 반드시 아래 JSON만 출력:
 {
@@ -150,7 +136,9 @@ def classify_units(text: str) -> dict:
     normalized = []
     seen = set()
 
-    for u in units[:CLASSIFY_MAX_UNITS]:
+    max_units = int(os.getenv("CLASSIFY_MAX_UNITS", "8"))
+
+    for u in units[:max_units]:
         if not isinstance(u, dict):
             continue
         t = str(u.get("text", "")).strip()
@@ -168,77 +156,115 @@ def classify_units(text: str) -> dict:
 
 
 # =========================
-# 검색 RPC
-# Supabase 함수:
-# match_symptom_statements(query_embedding vector(1536), match_count int)
-# returns row_id, disease_id, embed_txt, score, title, url
+# disease_clues 로드
 # =========================
-def rpc_match_symptom_statements(query_vec: list[float], match_count: int) -> list[dict]:
-    if not query_vec:
-        return []
+def load_disease_clues() -> list[dict]:
+    resp = (
+        sb.table("disease_clues")
+        .select("disease_id, title, url, clues, clues_json")
+        .eq("is_active", True)
+        .execute()
+    )
 
-    vec_literal = vec_to_pgvector_literal(query_vec)
-    resp = sb.rpc(
-        "match_symptom_statements",
-        {
-            "query_embedding": vec_literal,
-            "match_count": match_count
-        }
-    ).execute()
+    rows = resp.data or []
+    normalized = []
 
-    return resp.data or []
+    for r in rows:
+        clues_json = r.get("clues_json", [])
+        if isinstance(clues_json, str):
+            try:
+                clues_json = json.loads(clues_json)
+            except:
+                clues_json = []
 
+        if not isinstance(clues_json, list):
+            clues_json = []
 
-def aggregate_best_only(unit_matches: list[dict], topk: int) -> list[dict]:
-    """
-    질환별로 가장 유사한 문장 1개만 남김.
-    그 1개 score로 Top-K 추천.
-    """
-    best_by_disease = {}
-
-    for item in unit_matches:
-        unit_text = item["unit_text"]
-        matches = item["matches"]
-
-        for r in matches:
-            disease_id = r.get("disease_id")
-            if not disease_id:
-                continue
-
-            score = float(r.get("score", 0.0) or 0.0)
-
-            candidate = {
-                "id": disease_id,
-                "title": r.get("title", "") or "",
-                "url": r.get("url", "") or "",
-                "score_total": round(score, 6),
-                "best_match_text": r.get("embed_txt", "") or "",
-                "best_match_score": round(score, 6),
-                "matched_unit": unit_text,
-                "row_id": r.get("row_id", "") or ""
-            }
-
-            prev = best_by_disease.get(disease_id)
-            if prev is None or score > prev["best_match_score"]:
-                best_by_disease[disease_id] = candidate
-
-    results = list(best_by_disease.values())
-    results.sort(key=lambda x: x["best_match_score"], reverse=True)
-
-    # 응답 정리
-    final = []
-    for r in results[:topk]:
-        final.append({
-            "id": r["id"],
-            "title": r["title"],
-            "url": r["url"],
-            "score_total": r["score_total"],
-            "best_match_text": r["best_match_text"],
-            "best_match_score": r["best_match_score"],
-            "matched_unit": r["matched_unit"],
-            "row_id": r["row_id"]
+        normalized.append({
+            "disease_id": r.get("disease_id", ""),
+            "title": r.get("title", ""),
+            "url": r.get("url", ""),
+            "clues": r.get("clues", "") or "",
+            "clues_json": [str(x).strip() for x in clues_json if str(x).strip()]
         })
-    return final
+
+    return normalized
+
+
+# =========================
+# LLM 질환 선택
+# =========================
+DISEASE_PICKER_SYSTEM_PROMPT = """
+너는 치과 증상 큐레이션 검색용 질환 추천기다.
+
+목표:
+- 사용자의 증상/불편감 설명을 읽고,
+- 제공된 질환 목록 안에서만,
+- 관련 있을 수 있는 질환을 여러 개 고른다.
+
+중요:
+- 정확한 진단을 하려는 것이 아니다.
+- 사용자의 증상으로 "나타날 수 있는 질환 후보"를 넓게 고른다.
+- 완전히 무관한 질환은 넣지 않는다.
+- 제공된 목록 밖의 질환명을 만들지 않는다.
+- 입력이 모호해도 증상 기반이면 가능한 범위에서 관련 질환을 고른다.
+- high / medium / low 중 하나로 relevance를 표시한다.
+- 결과는 관련성 높은 순서대로 정렬한다.
+- 최대 7개까지 반환한다.
+- reason은 1문장으로 짧게 작성한다.
+
+반드시 아래 JSON만 출력:
+{
+  "related_diseases": [
+    {
+      "disease_id": "...",
+      "title": "...",
+      "relevance": "high",
+      "reason": "..."
+    }
+  ]
+}
+"""
+
+
+def pick_related_diseases_with_llm(user_text: str, units: list[dict], disease_clues: list[dict]) -> dict:
+    payload = {
+        "user_input": user_text,
+        "units": units,
+        "disease_candidates": disease_clues
+    }
+
+    resp = oa.chat.completions.create(
+        model=CLASSIFY_MODEL,
+        temperature=0,
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": DISEASE_PICKER_SYSTEM_PROMPT},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}
+        ]
+    )
+
+    return safe_json_loads(resp.choices[0].message.content)
+
+
+# =========================
+# 관리자용 disease_clues 점검
+# =========================
+@app.post("/admin/check-disease-clues")
+def admin_check_disease_clues():
+    token = request.args.get("token", "")
+    if not ADMIN_TOKEN or token != ADMIN_TOKEN:
+        return jsonify({"error": "unauthorized"}), 401
+
+    try:
+        rows = load_disease_clues()
+        return jsonify({
+            "ok": True,
+            "count": len(rows),
+            "sample": rows[:3]
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 # =========================
@@ -257,13 +283,12 @@ def classify():
     if not text:
         return jsonify({"ok": False, "error": "text is required"}), 400
 
-    # 질문만 차단, 모호한 입력은 통과
     if looks_non_symptom_question(text):
         return jsonify({
             "ok": True,
             "input": text,
             "is_symptom_search": False,
-            "message": "증상 검색용 입력이 아닙니다. 현재 느끼는 증상이나 변화를 적어주세요. 예: 찬물 마시면 특정 치아가 찌릿해요",
+            "message": "증상 검색용 입력이 아닙니다. 현재 느끼는 증상이나 변화를 적어주세요.",
             "units": []
         })
 
@@ -281,12 +306,11 @@ def classify():
 @app.post("/smart-search")
 def smart_search():
     """
-    새 로직:
-    1) 질문성 문의만 차단
-    2) 모호한 입력은 그대로 통과
-    3) LLM으로 의미 단위 분리
-    4) 각 단위를 symptom_statements에서 벡터검색
-    5) 질환별 '가장 높은 문장 1개'만 기준으로 Top-K 추천
+    LLM 기반 관련 질환 열거:
+    1) 증상 검색이 아닌 질문만 차단
+    2) LLM으로 의미 단위 분리
+    3) Supabase disease_clues 읽기
+    4) LLM이 disease_clues 안에서 관련 질환 여러 개 선택
     """
     data = request.get_json(silent=True) or {}
     q = (data.get("text") or "").strip()
@@ -298,16 +322,12 @@ def smart_search():
         return jsonify({
             "query": q,
             "blocked": True,
-            "message": "증상 검색용 입력이 아닙니다. 가격, 예약, 위치, 보험 문의 대신 현재 느끼는 증상을 적어주세요.",
-            "results": [],
-            "units": []
+            "message": "증상 검색용 입력이 아닙니다. 가격, 예약, 위치, 보험 문의 대신 현재 느끼는 증상이나 변화를 적어주세요.",
+            "results": []
         }), 200
 
     topk = int(data.get("k") or DEFAULT_TOPK)
     topk = max(1, min(20, topk))
-
-    fetch_k = int(data.get("fetch_k") or DEFAULT_FETCH_K)
-    fetch_k = max(5, min(100, fetch_k))
 
     try:
         cls = classify_units(q)
@@ -324,96 +344,117 @@ def smart_search():
         }), 200
 
     units = cls["units"]
-
-    # 모호한 입력이라도 units가 하나도 없으면 전체 문장을 그대로 1개 unit로 사용
     if not units:
         units = [{"text": q}]
 
-    unit_matches = []
+    try:
+        disease_clues = load_disease_clues()
+    except Exception as e:
+        return jsonify({
+            "query": q,
+            "blocked": True,
+            "message": f"disease_clues load failed: {str(e)}",
+            "results": [],
+            "units": units
+        }), 500
 
-    for unit in units:
-        unit_text = (unit.get("text") or "").strip()
-        if not unit_text:
+    if not disease_clues:
+        return jsonify({
+            "query": q,
+            "blocked": False,
+            "message": "질환 단서 데이터가 비어 있습니다.",
+            "results": [],
+            "units": units
+        }), 200
+
+    try:
+        llm_result = pick_related_diseases_with_llm(q, units, disease_clues)
+    except Exception as e:
+        return jsonify({
+            "query": q,
+            "blocked": True,
+            "message": f"llm disease search failed: {str(e)}",
+            "results": [],
+            "units": units
+        }), 500
+
+    raw_related = llm_result.get("related_diseases", [])
+    if not isinstance(raw_related, list):
+        raw_related = []
+
+    # disease_clues metadata lookup
+    meta_by_id = {x["disease_id"]: x for x in disease_clues}
+
+    results = []
+    for item in raw_related:
+        if not isinstance(item, dict):
             continue
 
-        try:
-            q_vec = embed_text(unit_text)
-            rows = rpc_match_symptom_statements(q_vec, fetch_k)
-        except Exception as e:
-            return jsonify({"error": f"vector search failed: {str(e)}"}), 500
+        disease_id = str(item.get("disease_id", "")).strip()
+        if not disease_id:
+            continue
 
-        unit_matches.append({
-            "unit_text": unit_text,
-            "matches": rows
+        meta = meta_by_id.get(disease_id, {})
+
+        title = str(item.get("title", "")).strip() or meta.get("title", "")
+        relevance = normalize_relevance(str(item.get("relevance", "medium")))
+        reason = str(item.get("reason", "")).strip()
+
+        if relevance == "high":
+            score = 0.9
+        elif relevance == "medium":
+            score = 0.6
+        else:
+            score = 0.3
+
+        results.append({
+            "id": disease_id,
+            "title": title,
+            "url": meta.get("url", ""),
+            "relevance": relevance,
+            "score_total": score,
+            "reason": reason
         })
 
-    results = aggregate_best_only(unit_matches, topk=topk)
+    # 중복 제거
+    dedup = {}
+    for r in results:
+        did = r["id"]
+        prev = dedup.get(did)
+        if prev is None:
+            dedup[did] = r
+        else:
+            # high > medium > low
+            order = {"high": 3, "medium": 2, "low": 1}
+            if order.get(r["relevance"], 0) > order.get(prev["relevance"], 0):
+                dedup[did] = r
+
+    final_results = list(dedup.values())
+    final_results.sort(
+        key=lambda x: (
+            {"high": 3, "medium": 2, "low": 1}.get(x["relevance"], 0),
+            x["title"]
+        ),
+        reverse=True
+    )
+    final_results = final_results[:topk]
 
     return jsonify({
         "query": q,
         "blocked": False,
-        "results": results,
+        "results": final_results,
         "units": units,
         "debug": {
-            "fetch_k": fetch_k,
-            "unit_count": len(units),
-            "unit_match_counts": [
-                {
-                    "unit_text": x["unit_text"],
-                    "match_count": len(x["matches"])
-                }
-                for x in unit_matches
-            ]
+            "disease_clue_count": len(disease_clues),
+            "unit_count": len(units)
         }
     })
 
 
-@app.post("/admin/embed-symptom-statements")
-def admin_embed_symptom_statements():
-    token = request.args.get("token", "")
-    if not ADMIN_TOKEN or token != ADMIN_TOKEN:
-        return jsonify({"error": "unauthorized"}), 401
-
-    limit_n = int(request.args.get("limit", "500"))
-    limit_n = max(1, min(2000, limit_n))
-
-    try:
-        resp = (
-            sb.table("symptom_statements")
-            .select("row_id, embed_txt")
-            .is_("embedding", "null")
-            .limit(limit_n)
-            .execute()
-        )
-        rows = resp.data or []
-
-        updated = 0
-        failed = []
-
-        for r in rows:
-            row_id = r.get("row_id")
-            text = (r.get("embed_txt") or "").strip()
-
-            if not text:
-                failed.append({"row_id": row_id, "reason": "empty embed_txt"})
-                continue
-
-            try:
-                vec = embed_text(text)
-                sb.table("symptom_statements").update({
-                    "embedding": vec_to_pgvector_literal(vec)
-                }).eq("row_id", row_id).execute()
-                updated += 1
-            except Exception as e:
-                failed.append({"row_id": row_id, "reason": str(e)})
-
-        return jsonify({
-            "total_candidates": len(rows),
-            "updated": updated,
-            "failed": failed
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+# 선택: /llm-disease-search 별칭도 제공
+@app.post("/llm-disease-search")
+def llm_disease_search():
+    return smart_search()
 
 
 if __name__ == "__main__":
